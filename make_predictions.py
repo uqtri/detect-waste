@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 sys.path.append('./efficientdet')
 sys.path.append('./classifier')
 
@@ -62,9 +63,53 @@ def get_args_parser():
 
 def get_classifier(num_classes,
                    cls_name, checkpoint, device):
+    ckpt = torch.load(checkpoint, map_location='cpu')
+    state_dict = ckpt.get('state_dict', {})
+    fc_bias = state_dict.get('efficient_net._fc.bias')
+    if fc_bias is not None:
+        num_classes = int(fc_bias.shape[0])
+
     model = LitterClassification.load_from_checkpoint(
-        checkpoint, model_name=cls_name, lr=0, decay=0)
+        checkpoint,
+        model_name=cls_name,
+        lr=0,
+        decay=0,
+        num_classes=num_classes,
+    )
     return model.to(device)
+
+
+def infer_num_classes_from_checkpoint(checkpoint):
+    ckpt = torch.load(checkpoint, map_location='cpu')
+    state_dict = ckpt.get('state_dict', {})
+    fc_bias = state_dict.get('efficient_net._fc.bias')
+    if fc_bias is not None:
+        return int(fc_bias.shape[0])
+    return None
+
+
+def resolve_class_names(args, inferred_num_classes):
+    if inferred_num_classes is None:
+        return args.classes
+
+    # If user provided matching class names, keep them.
+    if len(args.classes) == inferred_num_classes:
+        return args.classes
+
+    # Try to recover ImageFolder ordering from training directory.
+    train_dir = Path('classifier/images_square/train')
+    if train_dir.is_dir():
+        folder_names = sorted([p.name for p in train_dir.iterdir() if p.is_dir()])
+        if len(folder_names) == inferred_num_classes:
+            print(f"Using class names from {train_dir} ({len(folder_names)} classes).")
+            return folder_names
+
+    # Fallback: keep inference running with generic labels.
+    print(
+        f"WARNING: --classes has {len(args.classes)} labels but checkpoint expects "
+        f"{inferred_num_classes}. Falling back to generic class names."
+    )
+    return [f'class_{i}' for i in range(inferred_num_classes)]
 
 
 def save_frames(args, img_size, num_iter=45913):
@@ -156,6 +201,11 @@ def save_frames(args, img_size, num_iter=45913):
 if __name__ == '__main__':
     parser = get_args_parser()
     args = parser.parse_args()
+    inferred_num_classes = None
+    if args.classifier:
+        inferred_num_classes = infer_num_classes_from_checkpoint(args.classifier)
+        args.classes = resolve_class_names(args, inferred_num_classes)
+
     img_size = EfficientNet.get_image_size(args.cls_name)
     if args.video:
         save_frames(args, img_size=img_size)

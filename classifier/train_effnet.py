@@ -1,13 +1,18 @@
 import os
 import argparse
 import numpy as np
+import torch
+import warnings
 from torch import DoubleTensor
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import (SubsetRandomSampler,
                                       WeightedRandomSampler)
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers.neptune import NeptuneLogger
+try:
+    from pytorch_lightning.loggers import NeptuneLogger
+except ImportError:
+    from pytorch_lightning.loggers.neptune import NeptuneLogger
 from efficientnet_pytorch import EfficientNet
 from torchvision import datasets
 import albumentations as A
@@ -15,6 +20,32 @@ from albumentations.pytorch.transforms import ToTensorV2
 from models.efficientnet import LitterClassification
 
 from train_resnet import make_weights_for_balanced_classes
+
+
+class SafeImageFolder(datasets.ImageFolder):
+    """ImageFolder variant that skips unreadable/corrupted image files."""
+
+    def __init__(self, *args, max_skip_retries=20, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_skip_retries = max_skip_retries
+
+    def __getitem__(self, index):
+        # If an image is corrupted, move to the next sample and continue.
+        for _ in range(self.max_skip_retries):
+            try:
+                return super().__getitem__(index)
+            except Exception as err:
+                sample_path = self.samples[index][0]
+                warnings.warn(
+                    f"Skipping unreadable image: {sample_path} ({err})",
+                    RuntimeWarning,
+                )
+                index = (index + 1) % len(self.samples)
+
+        raise RuntimeError(
+            "Too many unreadable images in a row. "
+            "Please clean the dataset files."
+        )
 
 
 def get_args_parser():
@@ -97,7 +128,12 @@ def main(args):
                                  A.VerticalFlip(),
                                  A.ShiftScaleRotate(),
                                  A.RandomBrightnessContrast(),
-                                 A.Cutout(),
+                                 A.CoarseDropout(
+                                     num_holes_range=(1, 8),
+                                     hole_height_range=(0.05, 0.2),
+                                     hole_width_range=(0.05, 0.2),
+                                     fill=0,
+                                 ),
                                  A.Normalize(mean=[0.485, 0.456, 0.406],
                                              std=[0.229, 0.224, 0.225]),
                                  ToTensorV2()])
@@ -106,11 +142,11 @@ def main(args):
                                 std=[0.229, 0.224, 0.225]),
                                 ToTensorV2()])
 
-    train_set = datasets.ImageFolder(
+    train_set = SafeImageFolder(
         root=TRAIN_DIR,
         transform=get_augmentation(train_transform))
 
-    test_set = datasets.ImageFolder(
+    test_set = SafeImageFolder(
         root=TEST_DIR,
         transform=get_augmentation(test_transform))
 
@@ -125,8 +161,8 @@ def main(args):
                              shuffle=False,
                              num_workers=args.batch_size)
 
-    if PSEUDO_DIR is not None:
-        pseudo_set = datasets.ImageFolder(
+    if os.path.isdir(PSEUDO_DIR):
+        pseudo_set = SafeImageFolder(
             root=PSEUDO_DIR,
             transform=get_augmentation(train_transform))
         pseudo_loader = DataLoader(pseudo_set,
@@ -154,13 +190,15 @@ def main(args):
 
     if args.neptune:
         # your NEPTUNE_API_TOKEN should be add to ~./bashrc to run this file
-        logger = NeptuneLogger(project_name='detectwaste/classification',
+        logger = NeptuneLogger(project='detectwaste/classification',
                                tags=[args.model, TRAIN_DIR])
     else:
-        logger = True
+        logger = None
 
-    # CPU:default,GPU:gpus,TPU:tpu_cores
-    trainer = pl.Trainer(gpus=[args.gpu],
+    # Lightning 2.x uses accelerator/devices instead of gpus
+    use_cuda = torch.cuda.is_available()
+    trainer = pl.Trainer(accelerator='gpu' if use_cuda else 'cpu',
+                         devices=[args.gpu] if use_cuda else 1,
                          max_epochs=args.epochs,
                          callbacks=[model_checkpoint],
                          logger=logger)
